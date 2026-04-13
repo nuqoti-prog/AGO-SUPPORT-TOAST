@@ -193,10 +193,11 @@
 
   function eventFingerprint(event) {
     const id = normalizeText(event?.id || '');
-    const fromStatus = normalizeText(event?.fromStatusKey || '') || 'none';
     const toStatus = normalizeText(event?.toStatusKey || event?.statusKey || '');
-    const type = normalizeText(event?.type || '');
-    return `${id}|${fromStatus}->${toStatus}|${type}`;
+    const username = formatToastUsername(event?.changerUsername || '');
+    const transitionVersion = Number(event?.transitionVersion || event?.changedAt || event?.sortTime || 0);
+    if (!id || !toStatus || !username) return '';
+    return `${id}|${toStatus}|${username}|${transitionVersion || 0}`;
   }
 
   
@@ -239,15 +240,36 @@
   }
 
 function pruneRecentToastEvents(now = Date.now()) {
-    return;
+    try {
+      recentToastEvents.forEach((expiry, key) => {
+        if (!expiry || expiry <= now) recentToastEvents.delete(key);
+      });
+      while (shownToastEvents.size > SHOWN_TOAST_MAX_ENTRIES) {
+        const firstKey = shownToastEvents.values().next().value;
+        if (!firstKey) break;
+        shownToastEvents.delete(firstKey);
+      }
+    } catch (e) {}
   }
 
   function wasToastShownRecently(event) {
-    return false;
+    const key = eventFingerprint(event);
+    if (!key) return false;
+    const now = Date.now();
+    pruneRecentToastEvents(now);
+    if (shownToastEvents.has(key)) return true;
+    const expiry = Number(recentToastEvents.get(key) || 0);
+    return !!(expiry && expiry > now);
   }
 
   function rememberToastEvent(event) {
-    return;
+    const key = eventFingerprint(event);
+    if (!key) return;
+    const expiry = Date.now() + Math.max(1000, TOAST_EVENT_DEDUP_MS || 0);
+    recentToastEvents.set(key, expiry);
+    shownToastEvents.add(key);
+    persistShownToastEvents();
+    pruneRecentToastEvents();
   }
 
   function applyChangerUsernameToToast(toast, username) {
@@ -357,6 +379,15 @@ function pruneRecentToastEvents(now = Date.now()) {
     }
     const displayEvent = await prepareToastEventForDisplay(event);
     if (!displayEvent) return false;
+    if (wasToastShownRecently(displayEvent)) {
+      hydrateExistingToastFromEvent(displayEvent);
+      return false;
+    }
+    const claimed = await claimToastDisplay(displayEvent);
+    if (!claimed) {
+      hydrateExistingToastFromEvent(displayEvent);
+      return false;
+    }
     showEventToast(displayEvent);
     return true;
   }

@@ -1325,7 +1325,8 @@
           changerUsername: current.changerUsername || '',
           editUrl: current.editUrl,
           reviewUrl: current.reviewUrl,
-          sortTime: current.sortTime || 0
+          sortTime: current.sortTime || 0,
+          transitionVersion: Number(current.transitionVersion || current.sortTime || 0)
         };
       })
       .filter(Boolean)
@@ -1357,7 +1358,8 @@
           changerUsername: current.changerUsername || '',
           editUrl: current.editUrl,
           reviewUrl: current.reviewUrl,
-          sortTime: current.sortTime || 0
+          sortTime: current.sortTime || 0,
+          transitionVersion: Number(current.transitionVersion || current.sortTime || Date.now())
         });
         return;
       }
@@ -1376,7 +1378,8 @@
           changerUsername: current.changerUsername || '',
           editUrl: current.editUrl || previous.editUrl,
           reviewUrl: current.reviewUrl || previous.reviewUrl,
-          sortTime: Math.max(current.sortTime || 0, previous.sortTime || 0)
+          sortTime: Math.max(current.sortTime || 0, previous.sortTime || 0),
+          transitionVersion: Number(current.transitionVersion || Date.now())
         });
       }
     });
@@ -1390,10 +1393,11 @@
 
   function eventFingerprint(event) {
     const id = normalizeText(event?.id || '');
-    const fromStatus = normalizeText(event?.fromStatusKey || '') || 'none';
     const toStatus = normalizeText(event?.toStatusKey || event?.statusKey || '');
-    const type = normalizeText(event?.type || '');
-    return `${id}|${fromStatus}->${toStatus}|${type}`;
+    const username = formatUsername(event?.changerUsername || '');
+    const transitionVersion = Number(event?.transitionVersion || event?.changedAt || event?.sortTime || 0);
+    if (!id || !toStatus || !username) return '';
+    return `${id}|${toStatus}|${username}|${transitionVersion || 0}`;
   }
 
   
@@ -1741,6 +1745,9 @@ function pruneRecentToastEvents(now = Date.now()) {
       const statusChanged = !!(nextStatusKey && prevStatusKey && nextStatusKey !== prevStatusKey);
       const currentChanger = normalizeText(current.changerUsername || '');
       const previousChanger = normalizeText(previous.changerUsername || '');
+      const nextTransitionVersion = statusChanged
+        ? now
+        : Number(current.transitionVersion || previous.transitionVersion || 0);
       nextItems[id] = {
         ...previous,
         ...current,
@@ -1753,6 +1760,7 @@ function pruneRecentToastEvents(now = Date.now()) {
         activeAt: current.activeAt || previous.activeAt || '',
         statusKey: nextStatusKey,
         changerUsername: currentChanger || (statusChanged ? '' : previousChanger),
+        transitionVersion: nextTransitionVersion,
         isQc: Boolean(current.isQc || previous.isQc),
         scheduledEnabled: current.scheduledEnabled === true ? true : (current.scheduledEnabled === false ? false : Boolean(previous.scheduledEnabled)),
         scheduledDateText: current.scheduledDateText != null ? normalizeText(current.scheduledDateText || '') : normalizeText(previous.scheduledDateText || ''),
@@ -2142,6 +2150,7 @@ function pruneRecentToastEvents(now = Date.now()) {
       editUrl: domMeta.editUrl || (currentNewsId() ? location.href : ''),
       reviewUrl: domMeta.reviewUrl || '',
       sortTime: Date.now(),
+      transitionVersion: Number(domMeta.transitionVersion || Date.now()),
       changerUsername: normalizeText(domMeta.changerUsername || '')
     };
 
@@ -2286,6 +2295,7 @@ function pruneRecentToastEvents(now = Date.now()) {
       editUrl: domMeta.editUrl || existing.editUrl || location.href,
       reviewUrl: domMeta.reviewUrl || existing.reviewUrl || getReviewUrlForItem(newsId, existing),
       sortTime: now,
+      transitionVersion: now,
       statusKey,
       isQc: Boolean(domMeta.isQc || existing.isQc),
       scheduledEnabled: domMeta.scheduledEnabled === true ? true : (domMeta.scheduledEnabled === false ? false : Boolean(existing.scheduledEnabled)),

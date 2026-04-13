@@ -22,6 +22,8 @@ const agoRecentNotificationKeys = new Map();
 let agoLastSmartOpen = { url: '', senderTabId: -1, at: 0 };
 const agoPendingReturnTabs = new Map();
 const agoPendingStatusConfirms = new Map();
+const agoPendingToastRetryTimers = new Map();
+let agoNotificationRegistryLock = Promise.resolve();
 
 function formatToastUsername(raw) {
   let value = String(raw || '').trim();
@@ -95,31 +97,36 @@ async function saveNotificationRegistry(registry) {
 }
 
 async function claimNotificationRegistryEntry(channel, dedupeKey, ttlMs, options = {}) {
-  const normalizedChannel = String(channel || '').trim();
-  const normalizedKey = String(dedupeKey || '').trim();
-  const forceMark = options && options.forceMark === true;
-  const ttlValue = Number(ttlMs || 0);
-  const ttl = ttlValue > 0 ? Math.max(1000, ttlValue) : 0;
-  if (!normalizedChannel || !normalizedKey) return { claimed: false, reason: 'missing_key' };
-  const compositeKey = `${normalizedChannel}:${normalizedKey}`;
-  const now = Date.now();
-  const pruned = pruneNotificationRegistryEntries(await getNotificationRegistry(), now);
-  const registry = pruned.registry;
-  const current = registry[compositeKey];
-  const isActive = !!(current && (!current.expiresAt || Number(current.expiresAt) > now));
-  if (isActive && !forceMark) {
-    if (pruned.mutated) await saveNotificationRegistry(registry);
-    return { claimed: false, reason: 'duplicate', key: compositeKey, entry: current };
-  }
-  registry[compositeKey] = {
-    channel: normalizedChannel,
-    dedupeKey: normalizedKey,
-    createdAt: Number(current?.createdAt || now),
-    markedAt: now,
-    expiresAt: ttl ? (now + ttl) : 0
+  const run = async () => {
+    const normalizedChannel = String(channel || '').trim();
+    const normalizedKey = String(dedupeKey || '').trim();
+    const forceMark = options && options.forceMark === true;
+    const ttlValue = Number(ttlMs || 0);
+    const ttl = ttlValue > 0 ? Math.max(1000, ttlValue) : 0;
+    if (!normalizedChannel || !normalizedKey) return { claimed: false, reason: 'missing_key' };
+    const compositeKey = `${normalizedChannel}:${normalizedKey}`;
+    const now = Date.now();
+    const pruned = pruneNotificationRegistryEntries(await getNotificationRegistry(), now);
+    const registry = pruned.registry;
+    const current = registry[compositeKey];
+    const isActive = !!(current && (!current.expiresAt || Number(current.expiresAt) > now));
+    if (isActive && !forceMark) {
+      if (pruned.mutated) await saveNotificationRegistry(registry);
+      return { claimed: false, reason: 'duplicate', key: compositeKey, entry: current };
+    }
+    registry[compositeKey] = {
+      channel: normalizedChannel,
+      dedupeKey: normalizedKey,
+      createdAt: Number(current?.createdAt || now),
+      markedAt: now,
+      expiresAt: ttl ? (now + ttl) : 0
+    };
+    await saveNotificationRegistry(registry);
+    return { claimed: true, key: compositeKey, entry: registry[compositeKey], forced: forceMark };
   };
-  await saveNotificationRegistry(registry);
-  return { claimed: true, key: compositeKey, entry: registry[compositeKey], forced: forceMark };
+  const next = agoNotificationRegistryLock.then(run, run);
+  agoNotificationRegistryLock = next.then(() => undefined, () => undefined);
+  return next;
 }
 
 async function markNotificationRegistryEntry(channel, dedupeKey, ttlMs) {
@@ -387,7 +394,8 @@ function buildNotificationEvents(prevItems, nextItems) {
       author: current.author || previous.author || '',
       fromStatusKey: previous.statusKey || '',
       toStatusKey: current.statusKey || '',
-      sortTime: Math.max(Number(current.sortTime || 0), Number(previous.sortTime || 0))
+      sortTime: Math.max(Number(current.sortTime || 0), Number(previous.sortTime || 0)),
+      transitionVersion: Number(current.transitionVersion || current.sortTime || Date.now())
     });
   });
 
@@ -400,7 +408,18 @@ function buildEventCandidateKey(event) {
   const id = String(event.id || '').trim();
   const fromStatus = String(event.fromStatusKey || '').trim() || 'none';
   const toStatus = String(event.toStatusKey || event.statusKey || '').trim();
-  return [type, id, fromStatus, toStatus].filter(Boolean).join('|');
+  const version = Number(event.transitionVersion || event.changedAt || event.sortTime || 0);
+  return [type, id, fromStatus, toStatus, version || 0].filter(Boolean).join('|');
+}
+
+function buildToastIdentityKey(event) {
+  if (!event || typeof event !== 'object') return '';
+  const id = String(event.id || '').trim();
+  const toStatus = String(event.toStatusKey || event.statusKey || '').trim();
+  const username = formatToastUsername(event.changerUsername || '');
+  const transitionVersion = Number(event.transitionVersion || event.changedAt || event.sortTime || 0);
+  if (!id || !toStatus || !username) return '';
+  return `${id}|${toStatus}|${username}|${transitionVersion || 0}`;
 }
 
 function clearPendingStatusConfirm(id) {
@@ -452,8 +471,13 @@ async function verifyAndEmitConfirmedEvent(event) {
     changerUsername: formatToastUsername(current?.changerUsername || event?.changerUsername || ''),
     editUrl: String(current?.editUrl || event?.editUrl || '').trim(),
     reviewUrl: String(current?.reviewUrl || event?.reviewUrl || '').trim(),
-    sortTime: Number(current?.sortTime || event?.sortTime || Date.now())
+    sortTime: Number(current?.sortTime || event?.sortTime || Date.now()),
+    transitionVersion: Number(current?.transitionVersion || event?.transitionVersion || current?.sortTime || event?.sortTime || Date.now())
   };
+
+  if (!formatToastUsername(confirmedEvent.changerUsername || '')) {
+    return { ok: true, skipped: true, reason: 'missing_username' };
+  }
 
   const confirmKey = buildEventCandidateKey(confirmedEvent);
   const claim = await claimNotificationRegistryEntry('confirmed', confirmKey, AGO_NOTIFY_DEDUP_MS);
@@ -476,7 +500,20 @@ function scheduleStatusConfirmation(event) {
   const token = { cancelled: false };
   agoPendingStatusConfirms.set(id, { event: snapshot, timer: token, at: Date.now() });
   Promise.resolve()
-    .then(() => verifyAndEmitConfirmedEvent(snapshot))
+    .then(async () => {
+      const result = await verifyAndEmitConfirmedEvent(snapshot);
+      if (result?.reason === 'missing_username') {
+        const retryKey = buildEventCandidateKey(snapshot);
+        const currentRetry = Number(snapshot._retryCount || 0);
+        if (retryKey && currentRetry < 6) {
+          const timer = setTimeout(() => {
+            agoPendingToastRetryTimers.delete(retryKey);
+            scheduleStatusConfirmation({ ...snapshot, _retryCount: currentRetry + 1 });
+          }, 350);
+          agoPendingToastRetryTimers.set(retryKey, timer);
+        }
+      }
+    })
     .catch(() => {})
     .finally(() => {
       const current = agoPendingStatusConfirms.get(id);
@@ -512,12 +549,7 @@ function buildNotificationPayload(event) {
 
 
 function buildToastEventKey(event) {
-  if (!event || typeof event !== 'object') return '';
-  const id = String(event.id || '').trim();
-  const fromStatus = String(event.fromStatusKey || '').trim() || 'none';
-  const toStatus = String(event.toStatusKey || event.statusKey || '').trim();
-  const type = String(event.type || '').trim();
-  return [id, `${fromStatus}->${toStatus}`, type].filter(Boolean).join('|');
+  return buildToastIdentityKey(event);
 }
 
 async function enrichToastEventFromCrm(event) {
@@ -580,9 +612,13 @@ async function broadcastToastEvent(event, options = {}) {
     statusLabel: String(resolvedEvent.statusLabel || '').trim(),
     editUrl: String(resolvedEvent.editUrl || '').trim(),
     reviewUrl: String(resolvedEvent.reviewUrl || '').trim(),
-    sortTime: Number(resolvedEvent.sortTime || Date.now())
+    sortTime: Number(resolvedEvent.sortTime || Date.now()),
+    transitionVersion: Number(resolvedEvent.transitionVersion || resolvedEvent.changedAt || resolvedEvent.sortTime || Date.now())
   } : null;
   if (!toastEvent || !toastEvent.id) return { ok: false, error: 'missing_event' };
+  if (toastEvent.type === 'status-change' && !formatToastUsername(toastEvent.changerUsername || '')) {
+    return { ok: true, skipped: true, reason: 'missing_username' };
+  }
 
   const dedupeKey = buildToastEventKey(toastEvent);
   if (!dedupeKey) return { ok: false, error: 'missing_key' };
@@ -598,19 +634,41 @@ async function broadcastToastEvent(event, options = {}) {
   const excludeTabId = Number(options.excludeTabId);
   const targets = (tabs || []).filter((tab) => tab && typeof tab.id === 'number' && tab.id >= 0 && !(excludeTabId >= 0 && tab.id === excludeTabId));
   if (!targets.length) return { ok: true, sent: 0, dedupeKey, skipped: true, reason: 'no_target_tabs' };
-  let sent = 0;
-  await Promise.all(targets.map((targetTab) => new Promise((resolve) => {
+  const sendEventToTab = (tabId) => new Promise((resolve) => {
     try {
-      chrome.tabs.sendMessage(targetTab.id, { type: 'AGO_PUSH_TOAST_EVENT', event: toastEvent }, () => {
-        try { void chrome.runtime.lastError; } catch (e) {}
-        sent += 1;
-        resolve();
+      chrome.tabs.sendMessage(tabId, { type: 'AGO_PUSH_TOAST_EVENT', event: toastEvent }, () => {
+        try {
+          const hasError = !!chrome.runtime.lastError;
+          resolve(!hasError);
+        } catch (e) {
+          resolve(false);
+        }
       });
     } catch (e) {
-      resolve();
+      resolve(false);
     }
-  })));
-  return { ok: true, sent, dedupeKey, tabIds: targets.map((tab) => tab.id) };
+  });
+
+  let preferredTabId = -1;
+  try {
+    const activeTabs = await queryTabs({ active: true, lastFocusedWindow: true });
+    const active = (activeTabs || []).find((tab) => tab && typeof tab.id === 'number' && tab.id >= 0);
+    if (active && targets.some((tab) => tab.id === active.id)) preferredTabId = active.id;
+  } catch (e) {}
+
+  if (preferredTabId >= 0) {
+    const delivered = await sendEventToTab(preferredTabId);
+    if (delivered) {
+      return { ok: true, sent: 1, dedupeKey, tabIds: [preferredTabId], preferredTabId };
+    }
+  }
+
+  let sent = 0;
+  await Promise.all(targets.map(async (targetTab) => {
+    const delivered = await sendEventToTab(targetTab.id);
+    if (delivered) sent += 1;
+  }));
+  return { ok: true, sent, dedupeKey, tabIds: targets.map((tab) => tab.id), preferredTabId: preferredTabId >= 0 ? preferredTabId : null, fallbackBroadcast: true };
 }
 
 async function handleItemsStorageChange(oldItems, newItems) {

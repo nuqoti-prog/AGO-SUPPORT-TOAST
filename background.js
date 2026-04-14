@@ -475,15 +475,17 @@ async function verifyAndEmitConfirmedEvent(event) {
     transitionVersion: Number(current?.transitionVersion || event?.transitionVersion || current?.sortTime || event?.sortTime || Date.now())
   };
 
-  if (!formatToastUsername(confirmedEvent.changerUsername || '')) {
-    return { ok: true, skipped: true, reason: 'missing_username' };
-  }
-
   const confirmKey = buildEventCandidateKey(confirmedEvent);
   const claim = await claimNotificationRegistryEntry('confirmed', confirmKey, AGO_NOTIFY_DEDUP_MS);
   if (!claim.claimed) return { ok: true, skipped: true, reason: 'duplicate_confirmed', dedupeKey: confirmKey };
 
-  await broadcastToastEvent(confirmedEvent, { force: false }).catch(() => {});
+  const broadcastResult = await broadcastToastEvent(confirmedEvent, { force: false }).catch(() => ({ ok: false, skipped: true, reason: 'broadcast_error' }));
+  if (broadcastResult?.reason === 'missing_username') {
+    return { ok: true, skipped: true, reason: 'missing_username' };
+  }
+  if (broadcastResult?.skipped && broadcastResult?.reason === 'duplicate') {
+    return { ok: true, skipped: true, reason: 'duplicate_realtime', dedupeKey: broadcastResult?.dedupeKey || confirmKey };
+  }
   const payload = buildNotificationPayload(confirmedEvent);
   if (payload && !shouldSkipDuplicateNotification(payload.dedupeKey)) {
     const sysClaim = await claimNotificationRegistryEntry('system', payload.dedupeKey, AGO_NOTIFY_REGISTRY_TTL_MS);

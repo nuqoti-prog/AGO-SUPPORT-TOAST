@@ -2126,9 +2126,11 @@ function pruneRecentToastEvents(now = Date.now()) {
     if (!recentLocalToastContext.until || recentLocalToastContext.until <= now) return false;
     const eventId = normalizeText(event?.id || '');
     const eventStatusKey = normalizeText(event?.toStatusKey || event?.statusKey || '');
-    if (!eventId) return true;
-    if (eventId === recentLocalToastContext.newsId) return true;
-    if (eventStatusKey && eventStatusKey === recentLocalToastContext.statusKey) return true;
+    const localId = normalizeText(recentLocalToastContext.newsId || '');
+    const localStatus = normalizeText(recentLocalToastContext.statusKey || '');
+    if (!eventId || !localId) return false;
+    if (eventId !== localId) return false;
+    if (eventStatusKey && localStatus && eventStatusKey !== localStatus) return false;
     return true;
   }
 
@@ -2535,7 +2537,30 @@ function pruneRecentToastEvents(now = Date.now()) {
   }
 
   function bindStorageDrivenNotifications() {
-    return;
+    try {
+      chrome.storage.onChanged.addListener((changes, area) => {
+        if (area !== 'local' || !changes) return;
+        const snapshotChange = Object.prototype.hasOwnProperty.call(changes, SNAPSHOT_KEY) ? changes[SNAPSHOT_KEY] : null;
+        const itemsChange = !snapshotChange && Object.prototype.hasOwnProperty.call(changes, ITEMS_KEY) ? changes[ITEMS_KEY] : null;
+        if (!snapshotChange && !itemsChange) return;
+
+        const oldItems = snapshotChange
+          ? (snapshotChange.oldValue?.items || {})
+          : (itemsChange?.oldValue || {});
+        const newItems = snapshotChange
+          ? (snapshotChange.newValue?.items || {})
+          : (itemsChange?.newValue || {});
+        const events = buildChangeEvents(oldItems, newItems)
+          .filter((event) => String(event?.type || '').trim() === 'status-change');
+        if (!events.length) return;
+        for (const event of events) {
+          if (shouldSuppressStorageToastEvent(event)) continue;
+          void scheduleEventToast(event, {
+            allowNonLeader: true
+          });
+        }
+      });
+    } catch (e) {}
   }
 
 
